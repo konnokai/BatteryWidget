@@ -124,7 +124,7 @@ CHARGING_FAIL:2}`。
 ## 參考程式碼
 
 - 本專案主程式：`Program.cs`
-- 命令列自檢模式：`bin\Release\net10.0-windows\RazerBatteryWidget.exe --probe`
+- 命令列自檢模式：`bin\Release\net10.0-windows\BatteryWidget.exe --probe`
 
 ## 相關檔案（逆向證據）
 

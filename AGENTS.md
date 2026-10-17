@@ -1,4 +1,4 @@
-# Agents — RazerBatteryWidget
+# Agents — BatteryWidget
 
 ## 這是什麼
 
@@ -9,13 +9,13 @@
 ## 專案地圖
 
 ```
-RazerBatteryWidget\
+BatteryWidget\
 ├── Program.cs            # 全部程式碼：Razer + ASUS 的 HID 協定 + 托盤 UI
-├── RazerBatteryWidget.csproj
+├── BatteryWidget.csproj
 ├── docs\protocol.md      # Razer Viper V4 Pro 的 HID 協定（最重要，先讀）
 ├── docs\protocol-asus.md # ROG Strix Go 2.4 耳機的 HID 協定（G-Helper 來源）
 ├── docs\armoury-socket-server.md  # ASUS 服務層逆向筆記（為什麼不走它）
-└── bin\Release\net10.0-windows\RazerBatteryWidget.exe
+└── bin\Release\net10.0-windows\BatteryWidget.exe
     命令列參數：
     --probe    查滑鼠＋耳機電量後印結果即退出（自檢）
     --debug    連同 --probe 使用，印出 frame debug 資訊
@@ -38,7 +38,7 @@ RazerBatteryWidget\
 
 - 沒有測試框架，`--probe` 就是最小驗證模式。
   改 frame／協定後一定先跑 `--probe --debug` 看輸出
-- 改完 exe 前先 `Stop-Process` 舊的 RazerBatteryWidget 再跑 `--probe`
+- 改完 exe 前先 `Stop-Process` 舊的 BatteryWidget 再跑 `--probe`
 - 兩個 process 同時讀同一個 HID 介面會互相干擾，
   輪詢實驗一次只留一個 reader
 - 系統裡其他裝置（如 ASUS VID 0x0B05）也有名字看起來一樣的 MI_03 介面，
@@ -54,12 +54,13 @@ RazerBatteryWidget\
 - ASUS 耳機：走 G-Helper 驗證過的 vendor HID（MI_03&COL03、reportId 0xFF），
   百分比用 mV 線性插值（滿 4.2V、保護下限 3.4V），跟 Armoury Crate 不一定一致
 - 托盤圖示永遠顯示滑鼠；耳機只在 tooltip 第二行顯示
-- 沒有開機自動啟動、沒有設定檔（輪詢週期 30s、低電量 15% 都是 hardcode const）
+- 開機自動啟動：選單開關，寫 HKCU Run key（`BatteryWidget` 值指向目前 exe）；
+  沒有其他設定檔（輪詢週期 30s、低電量 15% 都是 hardcode const）
+  （Run key 值名從 RazerBatteryWidget 改為 BatteryWidget，需重新勾選）
 - 一個 exe 若是前一版還在跑，記得先 Stop-Process 再 build/probe
 
 ## 潛在待辦（user 尚未拍板）
 
-- 開機自動啟動
 - 喚醒／重連行為調整
 - ASUS mV→% 曲線校準（目前跟 G-Helper 一致，跟 Armoury Crate 差一點）
 

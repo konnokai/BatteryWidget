@@ -11,13 +11,14 @@
 //   查電量 Set → 等 35ms → Get，回應 resp[1]=0x1B、resp[12]<<8|resp[11]=millivolts。
 //   協定來源：G-Helper（github.com/seerge/g-helper；Peripherals/Headset/Models/StrixGo24.cs），
 //   本專案對實機驗證成功（2026-10-17），細節見 docs\protocol-asus.md。
+using Microsoft.Win32;
 using Microsoft.Win32.SafeHandles;
 using System.Drawing.Drawing2D;
 using System.Management;
 using System.Runtime.InteropServices;
 using System.Text;
 
-namespace RazerBatteryWidget;
+namespace BatteryWidget;
 
 internal static class HidNative
 {
@@ -271,7 +272,7 @@ internal static class Program
             return;
         }
 
-        using var mutex = new Mutex(true, "RazerBatteryWidget_SingleInstance", out var isFirst);
+        using var mutex = new Mutex(true, "BatteryWidget_SingleInstance", out var isFirst);
         if (!isFirst) return;
 
         ApplicationConfiguration.Initialize();
@@ -308,6 +309,23 @@ internal sealed class HiddenTrayContext : ApplicationContext
     {
         var menu = new ContextMenuStrip();
         menu.Items.Add("手動更新", null, (_, _) => _ = PollAsync());
+
+        var autoStart = new ToolStripMenuItem("開機自動啟動") { Checked = IsAutoStartEnabled() };
+        autoStart.Click += (_, _) =>
+        {
+            bool enable = !autoStart.Checked;
+            try
+            {
+                SetAutoStart(enable);
+                autoStart.Checked = enable;
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"設定開機自動啟動失敗：{ex.Message}", "電量小工具");
+            }
+        };
+        menu.Items.Add(autoStart);
+
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("離開", null, (_, _) =>
         {
@@ -315,6 +333,24 @@ internal sealed class HiddenTrayContext : ApplicationContext
             Application.Exit();
         });
         return menu;
+    }
+
+    // 開機自啟動：HKCU Run key，只對目前使用者生效，不需要管理員權限。
+    private const string RunKeyPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
+    private const string RunValueName = "BatteryWidget";
+
+    private static bool IsAutoStartEnabled()
+    {
+        using var key = Registry.CurrentUser.OpenSubKey(RunKeyPath);
+        // 比對完整路徑：exe 搬過家時舊值算沒設，選單會顯示未勾選，重勾一次就修好。
+        return key?.GetValue(RunValueName) is string value && value == $"\"{Environment.ProcessPath}\"";
+    }
+
+    private static void SetAutoStart(bool enable)
+    {
+        using var key = Registry.CurrentUser.CreateSubKey(RunKeyPath);
+        if (enable) key.SetValue(RunValueName, $"\"{Environment.ProcessPath}\"");
+        else key.DeleteValue(RunValueName, false);
     }
 
     private async Task PollAsync()

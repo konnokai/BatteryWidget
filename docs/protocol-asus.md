@@ -124,7 +124,7 @@ headset = 75% charging = NotCharging
 ## 參考程式碼
 
 - 本專案主程式：`Program.cs`（`AsusHeadsetBattery` 類別）
-- 命令列自檢：`bin\Release\net10.0-windows\RazerBatteryWidget.exe --probe`
+- 命令列自檢：`bin\Release\net10.0-windows\BatteryWidget.exe --probe`
 
 ## 協定參考來源
 
