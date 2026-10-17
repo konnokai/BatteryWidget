@@ -187,11 +187,11 @@ internal static class AsusHeadsetBattery
         return frame;
     }
 
-    // 線性插值：滿電以 Li-ion 4.2V 為準、保護下限約 3.4V。
-    // 實測：充電中 4167→96%、待機 4078→85%；充電時電壓偏高、讀數略上飄是正常。
+    // 線性插值：飽充（充電燈熄）實測 4142mV = 100%，保護下限以 3400mV 為 0%。
+    // 用 round-half-up 除法：浮充電壓會抖 ±1mV，truncation 會讓插著電的耳機在 99/100% 之間跳。
     // ponytail: 想更準就用同一台耳機放電錄一組 mv→% 查表。
     private static int PercentFromMillivolts(int mv) =>
-        Math.Clamp((mv - 3400) * 100 / 800, 0, 100);
+        Math.Clamp(((mv - 3400) * 100 + 371) / 742, 0, 100);
 
     private static IEnumerable<string> CandidatePaths()
     {
@@ -238,6 +238,14 @@ internal static class AsusHeadsetBattery
                         {
                             _cachedPath = path;     // 記住成功路徑
                             int millivolts = (response[12] << 8) | response[11];
+                            // 耳機休眠中／醒來的過渡窗會回 valid frame 但 mV 是垃圾（實測出現 0%），
+                            // 物理合理範圍之外的讀數丟掉重讀，保留 上一輪的 last known。
+                            if (millivolts is < 3000 or > 4400)
+                            {
+                                if (debug) Console.WriteLine($"   millivolts={millivolts} out of sane range, skip");
+                                Thread.Sleep(40);
+                                continue;
+                            }
                             bool charging = response[9] == 0x0A;
                             int percent = PercentFromMillivolts(millivolts);
                             if (debug) Console.WriteLine($"   millivolts={millivolts} charging={charging}");
@@ -370,8 +378,12 @@ internal sealed class HiddenTrayContext : ApplicationContext
                 ? $"Razer Viper V4 Pro：{_lastGood.Percent}%（目前連不上，睡著了？）"
                 : "沒找到滑鼠（接收器沒插？）";
 
+        // resp[9]=0x0A 的語義其實是「插著線」：插著飽電進浮充後 byte 照樣 0x0A、LED 已熄。
+        // 所以插著且讀到滿電（>=100%）改標「充飽」，還在充的才顯示「充電中」。
         string headsetTip = headset.Ok
-            ? $"ROG Strix Go 2.4：{headset.Percent}%" + (headset.Charging == ChargingState.Charging ? "（充電中）" : "")
+            ? $"ROG Strix Go 2.4：{headset.Percent}%" +
+              (headset.Charging == ChargingState.Charging
+                  ? headset.Percent >= 100 ? "（充飽，插著電）" : "（充電中）" : "")
             : _lastGoodHeadset.Ok
                 ? $"ROG Strix Go 2.4：{_lastGoodHeadset.Percent}%（目前連不上，睡著了？）"
                 : "沒找到耳機";
