@@ -175,9 +175,7 @@ internal static class AsusHeadsetBattery
 
     // 查電量：[0xFF][08][00][FD][04][0x12][0xF1][0x03][0x52][0x01]，補零到 64B。
     // 回應 resp[1]=0x1B 才有效；resp[11..12]=millivolts (LE)、resp[9]==0x0A 表充電中。
-    // 百分比是 mV 對應的五段折線（G-Helper 的曲線，非線性百分比）：
-    //   >=4100→100、>=3800→75、>=3700→50、>=3500→25、其他→10。
-    // Armoury Crate 對同一 mV 會顯示不同 %（它有自己的曲線），本工具與 G-Helper 一致。
+    // 百分比用線性插值（滿電 4.2V、保護下限 3.4V），見 PercentFromMillivolts。
     private static byte[] BuildBatteryFrame()
     {
         var frame = new byte[64];               // 裝置的 feature report 長度是 64，短了 SetFeature 會回 error 87
@@ -188,8 +186,11 @@ internal static class AsusHeadsetBattery
         return frame;
     }
 
+    // 線性插值：滿電以 Li-ion 4.2V 為準、保護下限約 3.4V。
+    // 實測：充電中 4167→96%、待機 4078→85%；充電時電壓偏高、讀數略上飄是正常。
+    // ponytail: 想更準就用同一台耳機放電錄一組 mv→% 查表。
     private static int PercentFromMillivolts(int mv) =>
-        mv >= 4100 ? 100 : mv >= 3800 ? 75 : mv >= 3700 ? 50 : mv >= 3500 ? 25 : 10;
+        Math.Clamp((mv - 3400) * 100 / 800, 0, 100);
 
     private static IEnumerable<string> CandidatePaths()
     {

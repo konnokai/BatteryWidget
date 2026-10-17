@@ -52,7 +52,7 @@ RazerBatteryWidget\
 - 認兩台裝置：Viper V4 Pro（PID 00E6）＋ ROG Strix Go 2.4（PID 18D6）；
   換型號要改各自的 WMI filter
 - ASUS 耳機：走 G-Helper 驗證過的 vendor HID（MI_03&COL03、reportId 0xFF），
-  百分比是 mV 五段折線（跟 G-Helper 一致，可能跟 Armoury Crate 不同）
+  百分比用 mV 線性插值（滿 4.2V、保護下限 3.4V），跟 Armoury Crate 不一定一致
 - 托盤圖示永遠顯示滑鼠；耳機只在 tooltip 第二行顯示
 - 沒有開機自動啟動、沒有設定檔（輪詢週期 30s、低電量 15% 都是 hardcode const）
 - 一個 exe 若是前一版還在跑，記得先 Stop-Process 再 build/probe
