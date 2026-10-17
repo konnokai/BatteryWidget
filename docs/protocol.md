@@ -109,6 +109,71 @@ SDK 來源（解包的 `3647df12ddf26c37_0`）：`m=[2,7,132]`、desc
 chargingStatus:data[1], …}`，列舉表 `{NO_CHARGE_BATTERY_FULL:0, CHARGING:1,
 CHARGING_FAIL:2}`。
 
+## 接收器 LED 指示燈（2026-10-17 解出）
+
+HyperSpeed 接收器上有 3 顆 LED，Synapse 的「LED 指示燈」頁可以分別指定
+每顆要顯示什麼：
+
+```
+讀：rw 3、class 7、id 149（0x95），payload 空
+    回應 resp[9..11] = LED1..3 的顯示項目
+寫：rw 3、class 7、id 21（0x15），payload[0..2] = LED1..3 的顯示項目
+```
+
+顯示項目（ledStatus）：
+
+| 值 | Synapse 名稱 | 顯示 |
+|---|---|---|
+| 0 | Off | 關閉 |
+| 1 | Battery_Level | 電池電量（顏色隨電量：綠→紅） |
+| 2 | Connection_Quality | 連線品質（綠／黃／橘／紅） |
+| 3 | Polling_Rate | 輪循率（125Hz 紫、500 藍、1000 綠、2000 黃、4000 橘、8000 紅） |
+| 4 | Dpi_Stage | DPI 指示 |
+
+⚠️ 這兩條的 rw 是 **3**，不是電量指令的 2；其餘（txid、checksum、回應判斷）
+都跟電量指令相同。
+
+**顏色不能自己指定**：LED 的顏色由顯示項目決定，Chroma 那組指令
+（`Get LED ID List [80,3,137]`、`Get LED RGB [5,3,129]`、`Get LED State [3,3,128]`、
+`Get LED Effect [3,3,130]`、`Get LED Brightness [3,3,131]`）全部實測回
+`status 5 NOT_SUPPORTED`（2026-10-17，node probe）。想要「顏色會動態變」
+只能靠切換顯示項目。
+
+逆向來源（Synapse 4 SDK 解包 `3647df12ddf26c37_0`，模組 96578；UI 在
+Service Worker cache 的 js chunk）：
+
+- `te=[3,7,149]` + `oe="Get indicator LEDs Configuration"`；
+  `ne=[3,7,21]` + `ie="Set indicator LEDs Configuration"`
+- setter 把 `indicatorLedConfiguration` 依 `index` 排序、取 `ledStatus` 填進
+  80-byte payload；getter 把回應的 `data[i]` 當第 i 顆的 `ledStatus`
+- 五個選項的值：UI 列舉 `za4 = {Off:0, Battery_Level:1, Connection_Quality:2,
+  Polling_Rate:3, Dpi_Stage:4}`、LED 順序 `tE = {LED_1:0, LED_2:1, LED_3:2}`，
+  選單就是 `[{Off},{Battery_Level},{Connection_Quality},{Polling_Rate},{Dpi_Stage}]`
+- 值對照 Synapse 實際 profile：`indicatorLedConfiguration`
+  `[{"ledStatus":2,"index":0},{"ledStatus":1,"index":1},{"ledStatus":3,"index":2}]`
+  正好對上 Synapse UI 顯示（LED1=連線品質、LED2=電池電量、LED3=輪循率）
+
+## 接收器連線品質（2026-10-17 解出）
+
+```
+讀：rw 1、class 7、id 150（0x96），payload 空（Get Dongle Connection Quality Status）
+    回應 resp[9] = 品質列舉
+```
+
+| 值 | Synapse 列舉 | UI 顯示（＝接收器 LED 顏色） |
+|---|---|---|
+| 1 | Connection_Quality_Status_Red | 不良 |
+| 2 | Connection_Quality_Status_Orange | 尚可 |
+| 3 | Connection_Quality_Status_Yellow | 良好 |
+| 4 | Connection_Quality_Status_Green | 絕佳 |
+
+⚠️ 這個指令的 tuple 是 `[1,7,150]`：SDK 裡緊鄰的 `[2,0,218]`／`[2,0,90]`
+是 Game Mode，不是品質。rw 也不同（1，不是電量的 2）。
+
+來源：SDK getter `dongleConnectionQualityStatus: oW(ce, data[0])`，
+列舉 `{Red:1, Orange:2, Yellow:3, Green:4}`；`[1,7,150]` 對應
+`"Get Dongle Connection Quality Status"`。本工具拿它顯示在 tooltip 第三行。
+
 ## 已知未解
 
 - 判別「滑鼠睡了」vs「真的斷線」目前只能由連續 TIMEOUT/BUSY 推估。

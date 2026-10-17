@@ -19,6 +19,8 @@ BatteryWidget\
     命令列參數：
     --probe    查滑鼠＋耳機電量後印結果即退出（自檢）
     --debug    連同 --probe 使用，印出 frame debug 資訊
+    --set-leds 1,2,3  設定接收器 LED1..3 顯示項目
+               （1=電池電量、2=連線品質、3=輪循率）
 ```
 
 ## 協定重點（沒讀 docs\protocol.md 之前不要改 HID code）
@@ -53,8 +55,15 @@ BatteryWidget\
   換型號要改各自的 WMI filter
 - ASUS 耳機：走 G-Helper 驗證過的 vendor HID（MI_03&COL03、reportId 0xFF），
   百分比用 mV 線性插值（實測飽充 4142mV=100%、保護下限 3400mV=0%），跟 Armoury Crate 不一定一致
-- 托盤圖示永遠顯示滑鼠；耳機只在 tooltip 第二行顯示
-- 開機自動啟動：選單開關，寫 HKCU Run key（`BatteryWidget` 值指向目前 exe）；
+- 托盤圖示永遠顯示滑鼠；耳機只在 tooltip 第二行顯示，
+  第三行是接收器連線品質（絕佳／良好／尚可／不良；讀不到時保留上次值）
+- 托盤選單只有「設定…／手動更新／離開」；LED 設定、動態警示、開機自啟動
+  都在設定視窗（`SettingsForm`）
+  - 3 顆 LED 的顯示項目：關閉／電池電量／連線品質／輪循率／DPI 指示
+    （五個選項跟 Synapse 一樣）；滑鼠睡著時讀、寫都會失敗並跳錯誤訊息
+  - LED 動態警示：充電中或電量 ≤15% 時把 LED 1 切成電池電量
+    （低電量該模式是紅色），狀態結束後還原使用者設定；預設關
+- 開機自動啟動：設定視窗的勾選項，寫 HKCU Run key（`BatteryWidget` 值指向目前 exe）；
   沒有其他設定檔（輪詢週期 30s、低電量 15% 都是 hardcode const）
   （Run key 值名從 RazerBatteryWidget 改為 BatteryWidget，需重新勾選）
 - 一個 exe 若是前一版還在跑，記得先 Stop-Process 再 build/probe

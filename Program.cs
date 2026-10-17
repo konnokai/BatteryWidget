@@ -6,6 +6,8 @@
 // 查電量指令：rw=2, class=0x07, id=0x80（Get Battery Level）
 // 查充電狀態：rw=2, class=0x07, id=0x84（Get Device Charging Status），
 //   resp[10]=0 不充電 / 1 充電中 / 2 充電失敗；battery 回應裡沒有充電 byte。
+// 接收器 LED 指示燈：rw=3、class=0x07、id=149（讀）/21（寫）（Get/Set indicator LEDs Configuration），
+//   payload 與回應 0..2 = LED1..3 的顯示項目，1=電池電量、2=連線品質、3=輪循率。
 // ASUS 部分：ROG Strix Go 2.4 耳機（dongle VID 0B05 / PID 18D6）的 vendor 控制介面
 //   （HID usage page 0xFF00）走另一種 feature report：64B、reportId 0xFF，
 //   查電量 Set → 等 35ms → Get，回應 resp[1]=0x1B、resp[12]<<8|resp[11]=millivolts。
@@ -40,6 +42,27 @@ internal static class HidNative
 
     internal static bool GetFeature(SafeFileHandle device, byte[] buffer) =>
         HidD_GetFeature(device, buffer, buffer.Length);
+}
+
+// 接收器 LED 的顯示項目（Synapse「LED 指示燈」頁的五個選項）；
+// 數值就是寫進裝置的 ledStatus，來源：Synapse UI 的 `za4` 列舉
+// （Off:0, Battery_Level:1, Connection_Quality:2, Polling_Rate:3, Dpi_Stage:4）。
+internal enum IndicatorLedMode : byte
+{
+    Off = 0,                 // 關閉
+    BatteryLevel = 1,        // 電池電量
+    ConnectionQuality = 2,   // 連線品質
+    PollingRate = 3,         // 輪循率
+    DpiStage = 4,            // DPI 指示
+}
+
+// 接收器連線品質列舉（Synapse SDK 的 Connection_Quality_Status_*），值 = 回應 resp[9]。
+internal enum DongleQuality : byte
+{
+    Red = 1,     // 不良
+    Orange = 2,  // 尚可
+    Yellow = 3,  // 良好
+    Green = 4,   // 絕佳
 }
 
 // 充電狀態列舉：Synapse SDK 定義 NO_CHARGE_BATTERY_FULL=0、CHARGING=1、CHARGING_FAIL=2。
@@ -77,7 +100,7 @@ internal static class RazerMouseBattery
     // Viper V4 Pro 的滑鼠類產品線都以 VID 1532 開頭；只挑指令介面 MI_03。
     private const string DeviceFilter = "HID\\VID_1532&PID_00E6&MI_03";
 
-    private static byte[] BuildFrame(byte rw, byte cls, byte id, byte txid)
+    private static byte[] BuildFrame(byte rw, byte cls, byte id, byte txid, byte[]? payload = null)
     {
         // 91B wire = [reportId 0][0][txid][0,0,0][rw@6][class@7][id@8][payload@9…][xor(3..88)@89][0@90]
         //（對照 node-hid 實測成功 frame 與 SDK _createDataSend 的 90B dataSend＝bridge 再補一個 report byte）
@@ -86,6 +109,7 @@ internal static class RazerMouseBattery
         frame[6] = rw;
         frame[7] = cls;
         frame[8] = id;
+        payload?.CopyTo(frame, 9);
         byte xor = 0;
         for (int i = 3; i <= 88; i++) xor ^= frame[i];
         frame[89] = xor;                   // checksum
@@ -161,6 +185,45 @@ internal static class RazerMouseBattery
         }
         }
         return new BatteryReading(-1, false);
+    }
+
+    // 從候選路徑開裝置、送單一指令、等成功回應；全部失敗回 null（裝置睡了或不在）。
+    private static byte[]? Query(byte rw, byte cls, byte id, byte[]? payload = null, string[]? args = null)
+    {
+        args ??= Array.Empty<string>();
+        bool debug = args.Contains("--debug");
+        foreach (var path in CandidatePaths())
+        {
+            if (debug) Console.WriteLine($"[cmd] trying: {path}");
+            using var device = HidNative.OpenHid(path);
+            if (device.IsInvalid) continue;
+            for (int attempt = 0; attempt < 3; attempt++)
+            {
+                byte txid = (byte)Random.Shared.Next(32);
+                var response = TryQuery(device, BuildFrame(rw, cls, id, txid, payload), txid, args);
+                if (response is null) continue;
+                _cachedPath = path;          // 記住成功路徑，後續直接用
+                return response;
+            }
+        }
+        return null;
+    }
+
+    // 讀接收器 LED1..3 的顯示項目（Synapse SDK：Get indicator LEDs Configuration → [3,7,149]，
+    // 回應 resp[9..11] = LED1..3 的 ledStatus，值見 IndicatorLedMode）；讀不到回 null。
+    public static byte[]? ReadIndicatorLeds(string[]? args = null) => Query(0x03, 0x07, 149, null, args)?[9..12];
+
+    // 寫接收器 LED1..3 的顯示項目（Synapse SDK：Set indicator LEDs Configuration → [3,7,21]，
+    // payload[0..2] = LED1..3 的 ledStatus）；成功回 true。
+    public static bool SetIndicatorLeds(byte[] modes, string[]? args = null) =>
+        Query(0x03, 0x07, 21, modes, args) is not null;
+
+    // 讀接收器連線品質（Synapse SDK：Get Dongle Connection Quality Status → [1,7,150]，
+    // 回應 resp[9] = 1 紅 / 2 橘 / 3 黃 / 4 綠）；讀不到回 null。
+    public static DongleQuality? ReadDongleQuality(string[]? args = null)
+    {
+        var response = Query(0x01, 0x07, 150, null, args);
+        return response is null ? null : (DongleQuality)response[9];
     }
 }
 
@@ -266,6 +329,24 @@ internal static class Program
     [STAThread]
     private static void Main(string[] args)
     {
+        // 設定接收器 LED1..3 的顯示項目：--set-leds 1,2,3
+        //（1=電池電量、2=連線品質、3=輪循率；驗證用，托盤選單才是主要入口）
+        int setLedIdx = Array.IndexOf(args, "--set-leds");
+        if (setLedIdx >= 0)
+        {
+            var parts = (setLedIdx + 1 < args.Length ? args[setLedIdx + 1] : "").Split(',');
+            if (parts.Length != 3 ||
+                !parts.All(p => byte.TryParse(p, out var v) && v is >= (byte)IndicatorLedMode.Off and <= (byte)IndicatorLedMode.DpiStage))
+            {
+                Console.WriteLine("usage: --set-leds 1,2,3  (0=off, 1=battery, 2=connection, 3=polling, 4=dpi)");
+                return;
+            }
+            Console.WriteLine(RazerMouseBattery.SetIndicatorLeds(parts.Select(byte.Parse).ToArray(), args)
+                ? "set receiver LEDs ok"
+                : "set receiver LEDs failed (asleep?)");
+            return;
+        }
+
         // 自檢模式：node probe 的 C# 版本，直接印結果後離開。
         if (args.Contains("--probe"))
         {
@@ -273,6 +354,14 @@ internal static class Program
             Console.WriteLine(mouse.Ok
                 ? $"mouse = {mouse.Percent}% charging = {mouse.Charging}"
                 : "mouse not found / asleep");
+            var leds = RazerMouseBattery.ReadIndicatorLeds(args);
+            Console.WriteLine(leds is null
+                ? "receiver LED1..3 not readable"
+                : $"receiver LED1..3 = {string.Join(' ', leds)}");
+            var quality = RazerMouseBattery.ReadDongleQuality(args);
+            Console.WriteLine(quality is null
+                ? "dongle quality not readable"
+                : $"dongle quality = {(byte)quality.Value} ({quality})");
             var headset = AsusHeadsetBattery.Read(args);
             Console.WriteLine(headset.Ok
                 ? $"headset = {headset.Percent}% charging = {headset.Charging}"
@@ -291,10 +380,21 @@ internal static class Program
 internal sealed class HiddenTrayContext : ApplicationContext
 {
     private static readonly int PollSeconds = 30;
+    private const int LowPercent = 15;          // 低電量門檻：tooltip 警示跟 LED 動態警示共用
     private readonly NotifyIcon _tray;
     private readonly System.Windows.Forms.Timer _timer = new() { Interval = PollSeconds * 1000 };
     private BatteryReading _lastGood = new(-1, false);
     private BatteryReading _lastGoodHeadset = new(-1, false);
+    private byte[]? _receiverLeds;      // 接收器 LED1..3 的顯示項目；裝置睡著時保留上一次
+    private DongleQuality? _lastQuality;   // 接收器連線品質；裝置睡著時保留上一次
+    private bool _ledAlertEnabled;      // LED 1 動態警示（設定視窗的開關，預設關）
+    private byte? _led1Saved;           // 警示前 LED 1 的設定，結束後還原
+    private string _mouseTip = "Razer Viper V4 Pro：查詢中…";
+    private string _headsetTip = "ROG Strix Go 2.4：查詢中…";
+    private DateTime _lastUpdate;
+    private SettingsForm? _settingsForm;
+
+    internal event Action? StateChanged;   // 每輪查詢完通知設定視窗更新畫面
 
     // 每輪都重新走 WMI 查路徑；_cachedPath 記住上一輪成功的路徑，下次優先試。
     public HiddenTrayContext()
@@ -311,29 +411,14 @@ internal sealed class HiddenTrayContext : ApplicationContext
         // 開程式馬上查一次，之後每 30 秒自動更新。
         _ = PollAsync();
         _timer.Start();
+        _tray.DoubleClick += (_, _) => OpenSettings();     // 托盤圖示雙擊＝開設定
     }
 
     private ContextMenuStrip BuildMenu()
     {
         var menu = new ContextMenuStrip();
+        menu.Items.Add("設定…", null, (_, _) => OpenSettings());
         menu.Items.Add("手動更新", null, (_, _) => _ = PollAsync());
-
-        var autoStart = new ToolStripMenuItem("開機自動啟動") { Checked = IsAutoStartEnabled() };
-        autoStart.Click += (_, _) =>
-        {
-            bool enable = !autoStart.Checked;
-            try
-            {
-                SetAutoStart(enable);
-                autoStart.Checked = enable;
-            }
-            catch (Exception ex)
-            {
-                MessageBox.Show($"設定開機自動啟動失敗：{ex.Message}", "電量小工具");
-            }
-        };
-        menu.Items.Add(autoStart);
-
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("離開", null, (_, _) =>
         {
@@ -341,6 +426,107 @@ internal sealed class HiddenTrayContext : ApplicationContext
             Application.Exit();
         });
         return menu;
+    }
+
+    // 從托盤開的視窗不會自己跳到前景（背景程序沒有前景權），要明講一次。
+    [DllImport("user32.dll")]
+    private static extern bool SetForegroundWindow(IntPtr hWnd);
+
+    internal void OpenSettings()
+    {
+        if (_settingsForm is { IsDisposed: false })
+        {
+            _settingsForm.WindowState = FormWindowState.Normal;
+            SetForegroundWindow(_settingsForm.Handle);
+            return;
+        }
+        _settingsForm = new SettingsForm(this);
+        _settingsForm.Show();
+        SetForegroundWindow(_settingsForm.Handle);
+    }
+
+    // 設定視窗讀的狀態（都跟 tooltip 同一份來源）。
+    internal string MouseStatusText => _mouseTip;
+    internal string HeadsetStatusText => _headsetTip;
+    internal string QualityText => _lastQuality is { } q ? $"接收器連線品質：{QualityName(q)}" : "接收器連線品質：未知";
+    internal string LastUpdateText => _lastUpdate == default ? "上次更新：—" : $"上次更新：{_lastUpdate:HH:mm:ss}";
+    internal byte[]? ReceiverLeds => _receiverLeds;
+
+    internal bool LedAlertEnabled
+    {
+        get => _ledAlertEnabled;
+        set
+        {
+            _ledAlertEnabled = value;
+            StateChanged?.Invoke();
+        }
+    }
+
+    internal bool AutoStart
+    {
+        get => IsAutoStartEnabled();
+        set
+        {
+            try { SetAutoStart(value); }
+            catch (Exception ex) { MessageBox.Show($"設定開機自動啟動失敗：{ex.Message}", "電量小工具"); }
+            StateChanged?.Invoke();
+        }
+    }
+
+    // 設定視窗改 LED：實際寫入在背景做，寫完更新畫面。
+    internal void ApplyLedSetting(int index, IndicatorLedMode mode) => _ = Task.Run(() => SetReceiverLed(index, mode));
+
+    // 設定視窗按「立即更新」。
+    internal void RequestUpdate() => _ = PollAsync();
+
+    // 只改指定那一顆：先讀裝置現值再改，避免蓋掉其他兩顆的設定。
+    private void SetReceiverLed(int index, IndicatorLedMode mode)
+    {
+        var current = _receiverLeds ?? RazerMouseBattery.ReadIndicatorLeds();
+        if (current is null)
+        {
+            MessageBox.Show("讀不到接收器 LED 設定（滑鼠睡著或在忙？）", "電量小工具");
+            return;
+        }
+        var next = (byte[])current.Clone();
+        next[index] = (byte)mode;
+        if (!RazerMouseBattery.SetIndicatorLeds(next))
+        {
+            MessageBox.Show("設定接收器 LED 失敗（滑鼠睡著或在忙？）", "電量小工具");
+            return;
+        }
+        _receiverLeds = next;
+        if (index == 0) _led1Saved = (byte)mode;   // 使用者改成新設定，警示結束後還原到這個
+        StateChanged?.Invoke();
+    }
+
+    // 動態警示：充電中或低電量時，LED 1 顯示電池電量（該模式低電量會變紅），
+    // 狀態結束後還原使用者原本的設定；本來就是電量模式就不動。
+    private byte[]? ApplyLedAlert(BatteryReading mouse, byte[]? current)
+    {
+        if (current is not { Length: 3 } leds) return current;
+        bool showBattery = _ledAlertEnabled &&
+            (mouse.Charging != ChargingState.NotCharging || mouse.Percent <= LowPercent);
+        if (showBattery && leds[0] != (byte)IndicatorLedMode.BatteryLevel)
+        {
+            var forced = (byte[])leds.Clone();
+            forced[0] = (byte)IndicatorLedMode.BatteryLevel;
+            if (!RazerMouseBattery.SetIndicatorLeds(forced)) return leds;
+            _led1Saved ??= leds[0];        // 記住警示前的設定，結束後還原
+            return forced;
+        }
+        if (!showBattery && _led1Saved is { } saved)
+        {
+            if (leds[0] != saved)
+            {
+                var restore = (byte[])leds.Clone();
+                restore[0] = saved;
+                if (!RazerMouseBattery.SetIndicatorLeds(restore)) return leds;
+                leds = restore;
+            }
+            _led1Saved = null;
+        }
+        return leds;
     }
 
     // 開機自啟動：HKCU Run key，只對目前使用者生效，不需要管理員權限。
@@ -363,14 +549,23 @@ internal sealed class HiddenTrayContext : ApplicationContext
 
     private async Task PollAsync()
     {
-        var (mouse, headset) = await Task.Run(() => (RazerMouseBattery.Read(), AsusHeadsetBattery.Read()));
+        // 裝置醒著才順便讀接收器 LED 設定；睡了就保留上次值（跟電量同一個做法）。
+        var (mouse, headset, leds, quality) = await Task.Run(() =>
+        {
+            var m = RazerMouseBattery.Read();
+            var cfg = m.Ok ? RazerMouseBattery.ReadIndicatorLeds() : null;
+            return (m, AsusHeadsetBattery.Read(), ApplyLedAlert(m, cfg),
+                m.Ok ? RazerMouseBattery.ReadDongleQuality() : null);
+        });
+        if (leds is not null) _receiverLeds = leds;
+        if (quality is not null) _lastQuality = quality;
 
         if (mouse.Ok) _lastGood = mouse;
         if (headset.Ok) _lastGoodHeadset = headset;
 
         // 圖示維持顯示滑鼠（跟原本一樣）；耳機走 tooltip 第二行。
         var shown = mouse.Ok ? mouse : _lastGood;
-        string mouseTip = mouse.Ok
+        _mouseTip = mouse.Ok
             ? $"Razer Viper V4 Pro：{mouse.Percent}%" +
               (mouse.Charging == ChargingState.Charging ? "（充電中）"
                : mouse.Charging == ChargingState.ChargingFailed ? "（充電異常？）" : "")
@@ -380,7 +575,7 @@ internal sealed class HiddenTrayContext : ApplicationContext
 
         // resp[9]=0x0A 的語義其實是「插著線」：插著飽電進浮充後 byte 照樣 0x0A、LED 已熄。
         // 所以插著且讀到滿電（>=100%）改標「充飽」，還在充的才顯示「充電中」。
-        string headsetTip = headset.Ok
+        _headsetTip = headset.Ok
             ? $"ROG Strix Go 2.4：{headset.Percent}%" +
               (headset.Charging == ChargingState.Charging
                   ? headset.Percent >= 100 ? "（充飽，插著電）" : "（充電中）" : "")
@@ -388,14 +583,28 @@ internal sealed class HiddenTrayContext : ApplicationContext
                 ? $"ROG Strix Go 2.4：{_lastGoodHeadset.Percent}%（目前連不上，睡著了？）"
                 : "沒找到耳機";
 
-        _tray.Text = $"{mouseTip}\n{headsetTip}";
+        _tray.Text = _lastQuality is { } q
+            ? $"{_mouseTip}\n{_headsetTip}\n接收器連線品質：{QualityName(q)}"
+            : $"{_mouseTip}\n{_headsetTip}";
         _tray.Icon?.Dispose();
         _tray.Icon = MakeIcon(shown.Ok ? shown.Percent : null, shown.Ok && shown.Charging == ChargingState.Charging);
-        if (mouse.Ok && mouse.Percent <= 15)
+        if (mouse.Ok && mouse.Percent <= LowPercent)
             _tray.ShowBalloonTip(5000, "Razer 電量小工具", "滑鼠快沒電了！", ToolTipIcon.Warning);
-        if (headset.Ok && headset.Percent >= 0 && headset.Percent <= 15)
+        if (headset.Ok && headset.Percent >= 0 && headset.Percent <= LowPercent)
             _tray.ShowBalloonTip(5000, "電量小工具", "耳機快沒電了！", ToolTipIcon.Warning);
+
+        _lastUpdate = DateTime.Now;
+        StateChanged?.Invoke();             // 設定視窗開著就順手更新
     }
+
+    // 連線品質的 LED 顏色 → Synapse 連線品質頁的說法。
+    private static string QualityName(DongleQuality quality) => quality switch
+    {
+        DongleQuality.Green => "絕佳",
+        DongleQuality.Yellow => "良好",
+        DongleQuality.Orange => "尚可",
+        _ => "不良",
+    };
 
     // 用數字畫成正方形小圖示：充電中＝藍、綠 >40、橘 15-40、紅 <15、灰＝查不到。
     private Icon MakeIcon(int? percent, bool charging = false)
@@ -416,5 +625,116 @@ internal sealed class HiddenTrayContext : ApplicationContext
         using var textBrush = new SolidBrush(Color.White);
         g.DrawString(text, font, textBrush, (32 - size.Width) / 2f, (32 - size.Height) / 2f + 1);
         return Icon.FromHandle(bmp.GetHicon());
+    }
+}
+
+// 設定視窗：托盤選單只留入口，LED 設定、動態警示、開機自啟動都在這裡。
+internal sealed class SettingsForm : Form
+{
+    private static readonly (IndicatorLedMode Mode, string Name)[] LedOptions =
+    {
+        (IndicatorLedMode.Off, "關閉"),
+        (IndicatorLedMode.BatteryLevel, "電池電量"),
+        (IndicatorLedMode.ConnectionQuality, "連線品質"),
+        (IndicatorLedMode.PollingRate, "輪循率"),
+        (IndicatorLedMode.DpiStage, "DPI 指示"),
+    };
+
+    private readonly HiddenTrayContext _owner;
+    private readonly Label _mouse = new() { AutoSize = true };
+    private readonly Label _headset = new() { AutoSize = true };
+    private readonly Label _quality = new() { AutoSize = true };
+    private readonly Label _updated = new() { AutoSize = true };
+    private readonly ComboBox[] _leds = new ComboBox[3];
+    private readonly CheckBox _ledAlert = new() { Text = "LED 1 自動顯示電量（充電或低於 15%）", AutoSize = true };
+    private readonly CheckBox _autoStart = new() { Text = "開機自動啟動", AutoSize = true };
+    private bool _loading;      // 更新畫面時不要把 SelectedIndexChanged 當成使用者操作
+
+    public SettingsForm(HiddenTrayContext owner)
+    {
+        _owner = owner;
+        Text = "電量小工具設定";
+        Font = new Font("Microsoft JhengHei UI", 10f);
+        FormBorderStyle = FormBorderStyle.FixedDialog;
+        MaximizeBox = false;
+        MinimizeBox = false;
+        StartPosition = FormStartPosition.CenterScreen;
+        ClientSize = new Size(400, 400);
+
+        var status = new GroupBox { Text = "目前狀態", Location = new Point(12, 12), Size = new Size(376, 128) };
+        _mouse.Location = new Point(16, 28);
+        _headset.Location = new Point(16, 52);
+        _quality.Location = new Point(16, 76);
+        _updated.Location = new Point(16, 100);
+        status.Controls.AddRange(new Control[] { _mouse, _headset, _quality, _updated });
+
+        var leds = new GroupBox { Text = "接收器 LED 指示燈", Location = new Point(12, 148), Size = new Size(376, 160) };
+        for (int i = 0; i < 3; i++)
+        {
+            leds.Controls.Add(new Label { Text = $"LED {i + 1}", Location = new Point(16, 30 + 30 * i), AutoSize = true });
+            var combo = new ComboBox
+            {
+                Location = new Point(84, 26 + 30 * i),
+                Width = 180,
+                DropDownStyle = ComboBoxStyle.DropDownList,
+                Tag = i,
+            };
+            combo.Items.AddRange(LedOptions.Select(o => (object)o.Name).ToArray());
+            combo.SelectedIndexChanged += LedChanged;
+            _leds[i] = combo;
+            leds.Controls.Add(combo);
+        }
+        _ledAlert.Location = new Point(16, 124);
+        _ledAlert.CheckedChanged += (_, _) => { if (!_loading) _owner.LedAlertEnabled = _ledAlert.Checked; };
+        leds.Controls.Add(_ledAlert);
+
+        _autoStart.Location = new Point(16, 324);
+        _autoStart.CheckedChanged += (_, _) => { if (!_loading) _owner.AutoStart = _autoStart.Checked; };
+
+        var refresh = new Button { Text = "立即更新", Location = new Point(12, 360), Size = new Size(100, 30) };
+        refresh.Click += (_, _) => _owner.RequestUpdate();
+        var close = new Button { Text = "關閉", Location = new Point(288, 360), Size = new Size(100, 30) };
+        close.Click += (_, _) => Close();
+
+        Controls.AddRange(new Control[] { status, leds, _autoStart, refresh, close });
+        AcceptButton = refresh;
+
+        _owner.StateChanged += OnStateChanged;
+        FormClosed += (_, _) => _owner.StateChanged -= OnStateChanged;
+        Populate();
+    }
+
+    // 事件可能從背景執行緒來（LED 寫完），拉回 UI 執行緒再動控制項。
+    private void OnStateChanged()
+    {
+        if (IsDisposed) return;
+        if (InvokeRequired) BeginInvoke(Populate);
+        else Populate();
+    }
+
+    private void Populate()
+    {
+        _loading = true;
+        try
+        {
+            _mouse.Text = _owner.MouseStatusText;
+            _headset.Text = _owner.HeadsetStatusText;
+            _quality.Text = _owner.QualityText;
+            _updated.Text = _owner.LastUpdateText;
+            var leds = _owner.ReceiverLeds;
+            for (int i = 0; i < _leds.Length; i++)
+                _leds[i].SelectedIndex = leds is not null && i < leds.Length
+                    ? Array.FindIndex(LedOptions, o => (byte)o.Mode == leds[i])
+                    : -1;
+            _ledAlert.Checked = _owner.LedAlertEnabled;
+            _autoStart.Checked = _owner.AutoStart;
+        }
+        finally { _loading = false; }
+    }
+
+    private void LedChanged(object? sender, EventArgs e)
+    {
+        if (_loading || sender is not ComboBox { Tag: int index } combo || combo.SelectedIndex < 0) return;
+        _owner.ApplyLedSetting(index, LedOptions[combo.SelectedIndex].Mode);
     }
 }
