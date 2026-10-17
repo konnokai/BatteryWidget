@@ -1,0 +1,65 @@
+# Agents — RazerBatteryWidget
+
+## 這是什麼
+
+常駐系統匣小工具，查詢 **Razer Viper V4 Pro** 的電量，讓使用者不必開啟
+Razer Synapse 主程式。Windows 11，.NET 10 + WinForms，
+僅依賴 `System.Management`（WMI）。
+
+## 專案地圖
+
+```
+RazerBatteryWidget\
+├── Program.cs            # 全部程式碼：HID 協定 + 托盤 UI
+├── RazerBatteryWidget.csproj
+├── docs\protocol.md      # 逆向得出的 HID 協定細節（最重要，先讀）
+└── bin\Release\net10.0-windows\RazerBatteryWidget.exe
+    命令列參數：
+    --probe    查詢電量後印結果即退出（自檢）
+    --debug    連同 --probe 使用，印出 frame debug 資訊
+```
+
+## 協定重點（沒讀 docs\protocol.md 之前不要改 HID code）
+
+1. 91-byte feature report：`txid@2`、`rw@6 / class@7 / id@8`、
+   checksum 在 byte89（bytes 3–88 XOR）
+2. 電量指令：rw `0x02`、class `0x07`、id `0x80`；回應 level 在 `resp[10]`，
+   % = floor(raw × 100 / 255)
+3. 充電狀態是**另一條指令**：rw `0x02`、class `0x07`、id `0x84`（132），
+   `resp[10]` = 0 不充電 / 1 充電中 / 2 失敗；battery(id 0x80) 回應裡
+   沒有充電 byte，`resp[11]` 恆為 0，不要從那裡猜
+4. 讀回應要迴圈直到 `resp[1]==2 && resp[2]==txid` 才代表有效
+5. 滑鼠睡著時裝置就是查不到（TIMEOUT/BUSY），**不是程式 bug**；
+   UI 要保最後已知值（和 Synapse 相同的做法）
+
+## 動手前注意
+
+- 沒有測試框架，`--probe` 就是最小驗證模式。
+  改 frame／協定後一定先跑 `--probe --debug` 看輸出
+- 改完 exe 前先 `Stop-Process` 舊的 RazerBatteryWidget 再跑 `--probe`
+- 兩個 process 同時讀同一個 HID 介面會互相干擾，
+  輪詢實驗一次只留一個 reader
+- 系統裡其他裝置（如 ASUS VID 0x0B05）也有名字看起來一樣的 MI_03 介面，
+  一定要過濾 `VID_1532 & PID_00E6`，否則會開到錯的裝置 →
+  HidD_SetFeature 失敗 error 1
+- node 對照版在 `C:\Users\admin\AppData\Local\Temp\opencode\hid-probe\probe-battery.mjs`
+  （JS 版協定驗證一直正確，可當 ground truth 對照）
+
+## 目前功能邊界
+
+- 只認 Viper V4 Pro（PID 00E6）；換型號要改 WMI filter
+- 充電狀態：已實作（class 7 / id 0x84 獨立查詢，tooltip 加「充電中」、
+  圖示轉藍，詳 docs\protocol.md）
+- 沒有開機自動啟動、沒有設定檔（輪詢週期 30s、低電量 15% 都是 hardcode const）
+
+## 潛在待辦（user 尚未拍板）
+
+- 開機自動啟動
+- 喚醒／重連行為調整
+
+## 環境陷阱
+
+- Windows 本機 console code page 950：跑 dotnet／CLI 時輸出中文可能
+  亂碼，判讀用 ASCII 或數字為準
+- RazerAppEngine 重啟後 device middleware 不會自己恢復，
+  需要重插接收器或重開 Synapse UI 才會重新 claim HID 介面
