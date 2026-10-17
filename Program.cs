@@ -6,6 +6,11 @@
 // 查電量指令：rw=2, class=0x07, id=0x80（Get Battery Level）
 // 查充電狀態：rw=2, class=0x07, id=0x84（Get Device Charging Status），
 //   resp[10]=0 不充電 / 1 充電中 / 2 充電失敗；battery 回應裡沒有充電 byte。
+// ASUS 部分：ROG Strix Go 2.4 耳機（dongle VID 0B05 / PID 18D6）的 vendor 控制介面
+//   （HID usage page 0xFF00）走另一種 feature report：64B、reportId 0xFF，
+//   查電量 Set → 等 35ms → Get，回應 resp[1]=0x1B、resp[12]<<8|resp[11]=millivolts。
+//   協定來源：G-Helper（github.com/seerge/g-helper；Peripherals/Headset/Models/StrixGo24.cs），
+//   本專案對實機驗證成功（2026-10-17），細節見 docs\protocol-asus.md。
 using Microsoft.Win32.SafeHandles;
 using System.Drawing.Drawing2D;
 using System.Management;
@@ -46,26 +51,30 @@ internal enum ChargingState : byte
 
 internal readonly record struct BatteryReading(int Percent, bool Ok, ChargingState Charging = ChargingState.NotCharging);
 
+// WMI 裡 HID 裝置的 DeviceID 是 HID\VID…\… 格式，CreateFile 要 \\?\HID#VID…#…#{GUID} 格式。
+internal static class HidPathFinder
+{
+    private const string HidClassInterfaceGuid = "{4d1e55b2-f16f-11cf-88cb-001111000030}";
+
+    // 用 WMI 枚舉符合 filter 的 HID 介面並轉成 CreateFile 可用的路徑。
+    public static List<string> FindPaths(string deviceFilter)
+    {
+        var result = new List<string>();
+        using var searcher = new ManagementObjectSearcher("SELECT DeviceID FROM Win32_PnPEntity");
+        foreach (var item in searcher.Get())
+        {
+            if (item["DeviceID"] is not string id || !id.StartsWith(deviceFilter, StringComparison.OrdinalIgnoreCase))
+                continue;
+            result.Add(@"\\?\" + id.Replace('\\', '#') + "#" + HidClassInterfaceGuid);
+        }
+        return result;
+    }
+}
+
 internal static class RazerMouseBattery
 {
     // Viper V4 Pro 的滑鼠類產品線都以 VID 1532 開頭；只挑指令介面 MI_03。
     private const string DeviceFilter = "HID\\VID_1532&PID_00E6&MI_03";
-    private const string HidClassInterfaceGuid = "{4d1e55b2-f16f-11cf-88cb-001111000030}";
-
-    private static List<string> FindCommandInterfacePaths()
-    {
-        var result = new List<string>();
-        using var searcher = new ManagementObjectSearcher(
-            "SELECT DeviceID FROM Win32_PnPEntity");
-        foreach (var item in searcher.Get())        {
-            if (item["DeviceID"] is not string id || !id.StartsWith(DeviceFilter, StringComparison.OrdinalIgnoreCase))
-                continue;
-            // WMI 的 DeviceID 是 HID\VID…\…\… 格式，CreateFile 要 \\?\HID#VID…#…#{GUID} 格式。
-            var path = @"\\?\" + id.Replace('\\', '#') + "#" + HidClassInterfaceGuid;
-            result.Add(path);
-        }
-        return result;
-    }
 
     private static byte[] BuildFrame(byte rw, byte cls, byte id, byte txid)
     {
@@ -92,7 +101,7 @@ internal static class RazerMouseBattery
     private static IEnumerable<string> CandidatePaths()
     {
         if (_cachedPath is not null) yield return _cachedPath;
-        foreach (var p in FindCommandInterfacePaths()) yield return p;
+        foreach (var p in HidPathFinder.FindPaths(DeviceFilter)) yield return p;
     }
 
     // 送出 frame 並輪詢回應；等不到有效回應（status=2 且 txid 相符）就回 null。
@@ -154,6 +163,94 @@ internal static class RazerMouseBattery
     }
 }
 
+// ROG Strix Go 2.4（dongle）電量查詢。
+// 協定抄自 G-Helper 的 StrixGo24（GPL-3，github.com/seerge/g-helper），
+// 已在本機實機驗證：SetFeature 64B → 35ms → GetFeature，COL03 是唯一會回的 vendor 介面。
+internal static class AsusHeadsetBattery
+{
+    private const string DeviceFilter = "HID\\VID_0B05&PID_18D6&MI_03";
+    private const byte ReportId = 0xFF;
+
+    private static string? _cachedPath;
+
+    // 查電量：[0xFF][08][00][FD][04][0x12][0xF1][0x03][0x52][0x01]，補零到 64B。
+    // 回應 resp[1]=0x1B 才有效；resp[11..12]=millivolts (LE)、resp[9]==0x0A 表充電中。
+    // 百分比是 mV 對應的五段折線（G-Helper 的曲線，非線性百分比）：
+    //   >=4100→100、>=3800→75、>=3700→50、>=3500→25、其他→10。
+    // Armoury Crate 對同一 mV 會顯示不同 %（它有自己的曲線），本工具與 G-Helper 一致。
+    private static byte[] BuildBatteryFrame()
+    {
+        var frame = new byte[64];               // 裝置的 feature report 長度是 64，短了 SetFeature 會回 error 87
+        frame[0] = ReportId;
+        frame[1] = 0x08; frame[2] = 0x00; frame[3] = 0xFD;
+        frame[4] = 0x04; frame[5] = 0x12; frame[6] = 0xF1; frame[7] = 0x03;
+        frame[8] = 0x52; frame[9] = 0x01;
+        return frame;
+    }
+
+    private static int PercentFromMillivolts(int mv) =>
+        mv >= 4100 ? 100 : mv >= 3800 ? 75 : mv >= 3700 ? 50 : mv >= 3500 ? 25 : 10;
+
+    private static IEnumerable<string> CandidatePaths()
+    {
+        if (_cachedPath is not null) yield return _cachedPath;
+        foreach (var p in HidPathFinder.FindPaths(DeviceFilter)) yield return p;
+    }
+
+    public static BatteryReading Read(string[]? args = null)
+    {
+        args ??= Array.Empty<string>();
+        bool debug = args.Contains("--debug");
+        _cachedPath = null;
+        foreach (var path in CandidatePaths())
+        {
+            if (debug) Console.WriteLine($"[asus] trying: {path}");
+            using (var device = HidNative.OpenHid(path))
+            {
+                if (device.IsInvalid)
+                {
+                    if (debug) Console.WriteLine("   open failed, err " + Marshal.GetLastWin32Error());
+                    continue;
+                }
+
+                for (int attempt = 0; attempt < 3; attempt++)
+                {
+                    var frame = BuildBatteryFrame();
+                    bool sent = HidNative.SetFeature(device, frame);
+                    if (!sent)
+                    {
+                        if (debug) Console.WriteLine("   SetFeature failed, err " + Marshal.GetLastWin32Error());
+                        break;                      // 這個介面不收 feature report，換下一個路徑
+                    }
+                    Thread.Sleep(35);               // G-Helper 同款：Set 後等 35ms 再 Get
+                    // 裝置剛醒來時第一次 Get 可能還没備好資料：持續重讀 GetFeature
+                    // （resp[1]==0x1B 才是好資料），不要重發 SetFeature，
+                    // 跟滑鼠那邊的坑同一款。
+                    for (int retry = 0; retry < 4; retry++)
+                    {
+                        var response = new byte[64];
+                        response[0] = ReportId;
+                        bool got = HidNative.GetFeature(device, response);
+                        if (debug) Console.WriteLine($"   Get={got} resp={Convert.ToHexString(response[..16])}");
+                        if (got && response[1] == 0x1B)
+                        {
+                            _cachedPath = path;     // 記住成功路徑
+                            int millivolts = (response[12] << 8) | response[11];
+                            bool charging = response[9] == 0x0A;
+                            int percent = PercentFromMillivolts(millivolts);
+                            if (debug) Console.WriteLine($"   millivolts={millivolts} charging={charging}");
+                            return new BatteryReading(percent, true,
+                                charging ? ChargingState.Charging : ChargingState.NotCharging);
+                        }
+                        Thread.Sleep(40);
+                    }
+                }
+            }
+        }
+        return new BatteryReading(-1, false);
+    }
+}
+
 internal static class Program
 {
     [STAThread]
@@ -162,8 +259,14 @@ internal static class Program
         // 自檢模式：node probe 的 C# 版本，直接印結果後離開。
         if (args.Contains("--probe"))
         {
-            var r = RazerMouseBattery.Read(args);
-            Console.WriteLine(r.Ok ? $"battery = {r.Percent}% charging = {r.Charging}" : "mouse not found / asleep");
+            var mouse = RazerMouseBattery.Read(args);
+            Console.WriteLine(mouse.Ok
+                ? $"mouse = {mouse.Percent}% charging = {mouse.Charging}"
+                : "mouse not found / asleep");
+            var headset = AsusHeadsetBattery.Read(args);
+            Console.WriteLine(headset.Ok
+                ? $"headset = {headset.Percent}% charging = {headset.Charging}"
+                : "headset not found / asleep");
             return;
         }
 
@@ -181,14 +284,15 @@ internal sealed class HiddenTrayContext : ApplicationContext
     private readonly NotifyIcon _tray;
     private readonly System.Windows.Forms.Timer _timer = new() { Interval = PollSeconds * 1000 };
     private BatteryReading _lastGood = new(-1, false);
+    private BatteryReading _lastGoodHeadset = new(-1, false);
 
-    // hold one handle so我們的 GetFeature 可以持續拿到當下狀態。
+    // 每輪都重新走 WMI 查路徑；_cachedPath 記住上一輪成功的路徑，下次優先試。
     public HiddenTrayContext()
     {
         _tray = new NotifyIcon
         {
             Icon = MakeIcon(null),
-            Text = "Razer 電量小工具：查詢中…",
+            Text = "電量小工具：查詢中…",
             Visible = true,
             ContextMenuStrip = BuildMenu(),
         };
@@ -214,23 +318,34 @@ internal sealed class HiddenTrayContext : ApplicationContext
 
     private async Task PollAsync()
     {
-        var reading = await Task.Run(() => RazerMouseBattery.Read());
-        if (reading.Ok) _lastGood = reading;
+        var (mouse, headset) = await Task.Run(() => (RazerMouseBattery.Read(), AsusHeadsetBattery.Read()));
 
-        // 滑鼠睡著時保留最後已知電量（跟 Synapse 一樣），tooltip 標注連不上。
-        var shown = reading.Ok ? reading : _lastGood;
-        string tip = reading.Ok
-            ? $"Razer Viper V4 Pro：{reading.Percent}%" +
-              (reading.Charging == ChargingState.Charging ? "（充電中）"
-               : reading.Charging == ChargingState.ChargingFailed ? "（充電異常？）" : "")
+        if (mouse.Ok) _lastGood = mouse;
+        if (headset.Ok) _lastGoodHeadset = headset;
+
+        // 圖示維持顯示滑鼠（跟原本一樣）；耳機走 tooltip 第二行。
+        var shown = mouse.Ok ? mouse : _lastGood;
+        string mouseTip = mouse.Ok
+            ? $"Razer Viper V4 Pro：{mouse.Percent}%" +
+              (mouse.Charging == ChargingState.Charging ? "（充電中）"
+               : mouse.Charging == ChargingState.ChargingFailed ? "（充電異常？）" : "")
             : _lastGood.Ok
                 ? $"Razer Viper V4 Pro：{_lastGood.Percent}%（目前連不上，睡著了？）"
                 : "沒找到滑鼠（接收器沒插？）";
-        _tray.Text = tip;
+
+        string headsetTip = headset.Ok
+            ? $"ROG Strix Go 2.4：{headset.Percent}%" + (headset.Charging == ChargingState.Charging ? "（充電中）" : "")
+            : _lastGoodHeadset.Ok
+                ? $"ROG Strix Go 2.4：{_lastGoodHeadset.Percent}%（目前連不上，睡著了？）"
+                : "沒找到耳機";
+
+        _tray.Text = $"{mouseTip}\n{headsetTip}";
         _tray.Icon?.Dispose();
         _tray.Icon = MakeIcon(shown.Ok ? shown.Percent : null, shown.Ok && shown.Charging == ChargingState.Charging);
-        if (reading.Ok && reading.Percent <= 15)
+        if (mouse.Ok && mouse.Percent <= 15)
             _tray.ShowBalloonTip(5000, "Razer 電量小工具", "滑鼠快沒電了！", ToolTipIcon.Warning);
+        if (headset.Ok && headset.Percent >= 0 && headset.Percent <= 15)
+            _tray.ShowBalloonTip(5000, "電量小工具", "耳機快沒電了！", ToolTipIcon.Warning);
     }
 
     // 用數字畫成正方形小圖示：充電中＝藍、綠 >40、橘 15-40、紅 <15、灰＝查不到。

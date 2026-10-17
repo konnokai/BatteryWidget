@@ -2,20 +2,22 @@
 
 ## 這是什麼
 
-常駐系統匣小工具，查詢 **Razer Viper V4 Pro** 的電量，讓使用者不必開啟
-Razer Synapse 主程式。Windows 11，.NET 10 + WinForms，
+常駐系統匣小工具，查詢 **Razer Viper V4 Pro 滑鼠**和 **ROG Strix Go 2.4 耳機**
+的電量，不必開 Razer Synapse 或 Armoury Crate。Windows 11，.NET 10 + WinForms，
 僅依賴 `System.Management`（WMI）。
 
 ## 專案地圖
 
 ```
 RazerBatteryWidget\
-├── Program.cs            # 全部程式碼：HID 協定 + 托盤 UI
+├── Program.cs            # 全部程式碼：Razer + ASUS 的 HID 協定 + 托盤 UI
 ├── RazerBatteryWidget.csproj
-├── docs\protocol.md      # 逆向得出的 HID 協定細節（最重要，先讀）
+├── docs\protocol.md      # Razer Viper V4 Pro 的 HID 協定（最重要，先讀）
+├── docs\protocol-asus.md # ROG Strix Go 2.4 耳機的 HID 協定（G-Helper 來源）
+├── docs\armoury-socket-server.md  # ASUS 服務層逆向筆記（為什麼不走它）
 └── bin\Release\net10.0-windows\RazerBatteryWidget.exe
     命令列參數：
-    --probe    查詢電量後印結果即退出（自檢）
+    --probe    查滑鼠＋耳機電量後印結果即退出（自檢）
     --debug    連同 --probe 使用，印出 frame debug 資訊
 ```
 
@@ -47,15 +49,19 @@ RazerBatteryWidget\
 
 ## 目前功能邊界
 
-- 只認 Viper V4 Pro（PID 00E6）；換型號要改 WMI filter
-- 充電狀態：已實作（class 7 / id 0x84 獨立查詢，tooltip 加「充電中」、
-  圖示轉藍，詳 docs\protocol.md）
+- 認兩台裝置：Viper V4 Pro（PID 00E6）＋ ROG Strix Go 2.4（PID 18D6）；
+  換型號要改各自的 WMI filter
+- ASUS 耳機：走 G-Helper 驗證過的 vendor HID（MI_03&COL03、reportId 0xFF），
+  百分比是 mV 五段折線（跟 G-Helper 一致，可能跟 Armoury Crate 不同）
+- 托盤圖示永遠顯示滑鼠；耳機只在 tooltip 第二行顯示
 - 沒有開機自動啟動、沒有設定檔（輪詢週期 30s、低電量 15% 都是 hardcode const）
+- 一個 exe 若是前一版還在跑，記得先 Stop-Process 再 build/probe
 
 ## 潛在待辦（user 尚未拍板）
 
 - 開機自動啟動
 - 喚醒／重連行為調整
+- ASUS mV→% 曲線校準（目前跟 G-Helper 一致，跟 Armoury Crate 差一點）
 
 ## 環境陷阱
 
