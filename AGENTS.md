@@ -19,8 +19,8 @@ BatteryWidget\
     命令列參數：
     --probe    查滑鼠＋耳機電量後印結果即退出（自檢）
     --debug    連同 --probe 使用，印出 frame debug 資訊
-    --set-leds 1,2,3  設定接收器 LED1..3 顯示項目
-               （1=電池電量、2=連線品質、3=輪循率）
+    --set-leds 0..4  設定接收器 LED1..3 顯示項目
+               （0=關閉、1=電池電量、2=連線品質、3=輪循率、4=DPI 指示）
 ```
 
 ## 協定重點（沒讀 docs\protocol.md 之前不要改 HID code）
