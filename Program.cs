@@ -130,12 +130,13 @@ internal static class RazerMouseBattery
     }
 
     // 送出 frame 並輪詢回應；等不到有效回應（status=2 且 txid 相符）就回 null。
-    private static byte[]? TryQuery(SafeFileHandle device, byte[] frame, byte txid, string[] dbgArgs)
+    // retries 是給關機路徑用的：那個場合沒時間等裝置慢慢醒。
+    private static byte[]? TryQuery(SafeFileHandle device, byte[] frame, byte txid, string[] dbgArgs, int retries = 30)
     {
         bool sent = HidNative.SetFeature(device, frame);
         if (dbgArgs.Contains("--debug")) Console.WriteLine($"   SetFeature={sent} txid={txid}");
         if (!sent) return null;
-        for (int retry = 0; retry < 30; retry++)
+        for (int retry = 0; retry < retries; retry++)
         {
             Thread.Sleep(80);                       // 裝置要時間準備回應
             var response = new byte[91];
@@ -188,7 +189,9 @@ internal static class RazerMouseBattery
     }
 
     // 從候選路徑開裝置、送單一指令、等成功回應；全部失敗回 null（裝置睡了或不在）。
-    private static byte[]? Query(byte rw, byte cls, byte id, byte[]? payload = null, string[]? args = null)
+    // attempts／retries 只在關機路徑調小（見 TurnOffIndicatorLeds），其餘走預設值。
+    private static byte[]? Query(byte rw, byte cls, byte id, byte[]? payload = null, string[]? args = null,
+        int attempts = 3, int retries = 30)
     {
         args ??= Array.Empty<string>();
         bool debug = args.Contains("--debug");
@@ -197,10 +200,10 @@ internal static class RazerMouseBattery
             if (debug) Console.WriteLine($"[cmd] trying: {path}");
             using var device = HidNative.OpenHid(path);
             if (device.IsInvalid) continue;
-            for (int attempt = 0; attempt < 3; attempt++)
+            for (int attempt = 0; attempt < attempts; attempt++)
             {
                 byte txid = (byte)Random.Shared.Next(32);
-                var response = TryQuery(device, BuildFrame(rw, cls, id, txid, payload), txid, args);
+                var response = TryQuery(device, BuildFrame(rw, cls, id, txid, payload), txid, args, retries);
                 if (response is null) continue;
                 _cachedPath = path;          // 記住成功路徑，後續直接用
                 return response;
@@ -217,6 +220,12 @@ internal static class RazerMouseBattery
     // payload[0..2] = LED1..3 的 ledStatus）；成功回 true。
     public static bool SetIndicatorLeds(byte[] modes, string[]? args = null) =>
         Query(0x03, 0x07, 21, modes, args) is not null;
+
+    // 三顆 LED 全部關掉（就是寫 0,0,0）。程式結束與系統關機前用：
+    // 接收器自己記著顯示項目，程式沒跑時燈照樣亮著。
+    // 重試次數砍到預設值的零頭，關機路徑不能停下來等裝置慢慢醒。
+    public static bool TurnOffIndicatorLeds() =>
+        Query(0x03, 0x07, 21, new byte[3], attempts: 2, retries: 12) is not null;
 
     // 讀接收器連線品質（Synapse SDK：Get Dongle Connection Quality Status → [1,7,150]，
     // 回應 resp[9] = 1 紅 / 2 橘 / 3 黃 / 4 綠）；讀不到回 null。
@@ -389,6 +398,8 @@ internal sealed class HiddenTrayContext : ApplicationContext
     private DongleQuality? _lastQuality;   // 接收器連線品質；裝置睡著時保留上一次
     private bool _ledAlertEnabled;      // LED 1 動態警示（設定視窗的開關，預設關）
     private byte? _led1Saved;           // 警示前 LED 1 的設定，結束後還原
+    private byte[]? _savedLeds = LoadSavedLeds();   // HKCU 記著的使用者設定（null = 還沒記過）
+    private bool _ledsSynced;                        // 啟動後已經跟裝置對過一次
     private string _mouseTip = "Razer Viper V4 Pro：查詢中…";
     private string _headsetTip = "ROG Strix Go 2.4：查詢中…";
     private DateTime _lastUpdate;
@@ -412,6 +423,10 @@ internal sealed class HiddenTrayContext : ApplicationContext
         _ = PollAsync();
         _timer.Start();
         _tray.DoubleClick += (_, _) => OpenSettings();     // 托盤圖示雙擊＝開設定
+
+        // _savedLeds 在欄位初始化時就讀好了（上面 _savedLeds = LoadSavedLeds()）。
+        // 關機／登出時 Windows 不會讓我們跑完 Application.Exit 之後的收尾，所以另外接這條。
+        SystemEvents.SessionEnding += (_, _) => TurnOffReceiverLeds();
     }
 
     private ContextMenuStrip BuildMenu()
@@ -422,10 +437,21 @@ internal sealed class HiddenTrayContext : ApplicationContext
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("離開", null, (_, _) =>
         {
+            TurnOffReceiverLeds();
             _tray.Visible = false;
             Application.Exit();
         });
         return menu;
+    }
+
+    // 收工前把接收器 LED 熄掉（托盤「離開」與系統關機／登出都走這裡）。
+    // 設定本身記在 HKCU，下次啟動的第一輪查詢會寫回裝置。
+    private static void TurnOffReceiverLeds()
+    {
+        // 關機途中 WMI 可能已經收攤（列舉路徑會丟例外），熄不掉就算了，
+        // 不能讓它在關機時炸出一個錯誤視窗。
+        try { RazerMouseBattery.TurnOffIndicatorLeds(); }
+        catch { }
     }
 
     // 從托盤開的視窗不會自己跳到前景（背景程序沒有前景權），要明講一次。
@@ -497,6 +523,10 @@ internal sealed class HiddenTrayContext : ApplicationContext
         }
         _receiverLeds = next;
         if (index == 0) _led1Saved = (byte)mode;   // 使用者改成新設定，警示結束後還原到這個
+        // 存「使用者選的」那一份：警示蓋掉的 LED1 記在 _led1Saved，別存成電池電量模式。
+        var user = (byte[])next.Clone();
+        if (_led1Saved is { } preAlert) user[0] = preAlert;
+        SaveLeds(user);
         StateChanged?.Invoke();
     }
 
@@ -529,6 +559,27 @@ internal sealed class HiddenTrayContext : ApplicationContext
         return leds;
     }
 
+    // 接收器 LED 設定：程式結束時會把 LED 熄掉，所以使用者的選擇得自己記著，
+    // 下次啟動再寫回裝置（裝置裡那組已經被我們蓋成 0,0,0 了）。
+    private const string LedKeyPath = @"Software\BatteryWidget";
+    private const string LedValueName = "ReceiverLeds";
+
+    private static byte[]? LoadSavedLeds()
+    {
+        using var key = Registry.CurrentUser.OpenSubKey(LedKeyPath);
+        var parts = (key?.GetValue(LedValueName) as string)?.Split(',');
+        if (parts is not { Length: 3 } ||
+            !parts.All(p => byte.TryParse(p, out var v) && v <= (byte)IndicatorLedMode.DpiStage))
+            return null;
+        return parts.Select(byte.Parse).ToArray();
+    }
+
+    private static void SaveLeds(byte[] modes)
+    {
+        using var key = Registry.CurrentUser.CreateSubKey(LedKeyPath);
+        key.SetValue(LedValueName, string.Join(',', modes));
+    }
+
     // 開機自啟動：HKCU Run key，只對目前使用者生效，不需要管理員權限。
     private const string RunKeyPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
     private const string RunValueName = "BatteryWidget";
@@ -554,6 +605,26 @@ internal sealed class HiddenTrayContext : ApplicationContext
         {
             var m = RazerMouseBattery.Read();
             var cfg = m.Ok ? RazerMouseBattery.ReadIndicatorLeds() : null;
+            // 收工會把 LED 熄掉，使用者的設定記在 HKCU：裝置醒了就把記著的寫回裝置；
+            // 還沒記過（第一次跑這版）就拿裝置上的現值當使用者的設定記下來。
+            // 裝置睡著讀不到就等之後某一輪再對；只對一次，之後不再動使用者的設定。
+            if (cfg is not null && !_ledsSynced)
+            {
+                if (_savedLeds is { } want)
+                {
+                    if (RazerMouseBattery.SetIndicatorLeds(want))
+                    {
+                        cfg = want;
+                        _ledsSynced = true;
+                    }
+                }
+                else
+                {
+                    SaveLeds(cfg);
+                    _savedLeds = cfg;
+                    _ledsSynced = true;
+                }
+            }
             return (m, AsusHeadsetBattery.Read(), ApplyLedAlert(m, cfg),
                 m.Ok ? RazerMouseBattery.ReadDongleQuality() : null);
         });

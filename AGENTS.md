@@ -63,8 +63,13 @@ BatteryWidget\
     （五個選項跟 Synapse 一樣）；滑鼠睡著時讀、寫都會失敗並跳錯誤訊息
   - LED 動態警示：充電中或電量 ≤15% 時把 LED 1 切成電池電量
     （低電量該模式是紅色），狀態結束後還原使用者設定；預設關
+  - 收工熄燈：托盤「離開」與系統關機／登出（`SystemEvents.SessionEnding`）
+    都會寫 `0,0,0` 把三顆 LED 熄掉；設定記在
+    `HKCU\Software\BatteryWidget`（值 `ReceiverLeds`），啟動後第一輪查詢
+    把設定寫回裝置（HKCU 還沒值時就先認養裝置上的現值）。滑鼠睡著時
+    寫不進去，那次燈就熄不掉（關機太快、程序被砍也是同一種下場）
 - 開機自動啟動：設定視窗的勾選項，寫 HKCU Run key（`BatteryWidget` 值指向目前 exe）；
-  沒有其他設定檔（輪詢週期 30s、低電量 15% 都是 hardcode const）
+  設定只有 LED 那一組（見上），輪詢週期 30s、低電量 15% 都是 hardcode const
   （Run key 值名從 RazerBatteryWidget 改為 BatteryWidget，需重新勾選）
 - 一個 exe 若是前一版還在跑，記得先 Stop-Process 再 build/probe
 
